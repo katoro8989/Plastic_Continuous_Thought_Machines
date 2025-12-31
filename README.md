@@ -4,7 +4,7 @@ This repository extends the original Continuous Thought Machine (CTM) with hyper
 
 ## Acknowledgments
 
-This project is based on the original [Continuous Thought Machines](https://github.com/SakanaAI/continuous-thought-machines) repository by Rémi Louf and SakanaAI. We thank the original authors for their excellent work.
+This project is based on the original [Continuous Thought Machines](https://github.com/SakanaAI/continuous-thought-machines) repository by SakanaAI. We thank the original authors for their excellent work.
 
 ## Motivation: Dynamic Weights for Plasticity
 
