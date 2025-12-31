@@ -2,6 +2,10 @@
 
 This repository extends the original Continuous Thought Machine (CTM) with hypernetwork support, enabling dynamic weight adjustment based on input state.
 
+## Acknowledgments
+
+This project is based on the original [Continuous Thought Machines](https://github.com/SakanaAI/continuous-thought-machines) repository by Rémi Louf and SakanaAI. We thank the original authors for their excellent work.
+
 ## Motivation: Dynamic Weights for Plasticity
 
 Standard recurrent neural networks, including the original CTM, use fixed weight matrices during inference. This means their processing rules remain static regardless of input changes or thought process evolution, lacking a mechanism to dynamically adapt to context changes.
