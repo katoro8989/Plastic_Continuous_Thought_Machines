@@ -254,7 +254,7 @@ The following figures compare learning trajectories for various accuracy metrics
 
 2. **Average and Final Tick Accuracy**: The proposed method demonstrates superior test performance for both average accuracy across all ticks and accuracy at the final tick. This improvement is particularly significant at the final tick, where the baseline method shows unstable and declining performance.
 
-3. **Stability**: The baseline method is vulnerable to performance degradation with prolonged "thought" processes due to fixed weights. In contrast, the proposed method remains stable and even improves performance over time by using dynamic weight adjustments to handle increasing complexity.
+3. **Stability**: The baseline method is vulnerable to performance degradation with prolonged thought processes due to fixed weights. In contrast, the proposed method remains stable and even improves performance over time by using dynamic weight adjustments to handle increasing complexity.
 
 ### Quantitative Results
 
@@ -269,8 +269,8 @@ The following figures compare learning trajectories for various accuracy metrics
 
 The results highlight several important advantages of the proposed approach:
 
-- **Better Calibration**: While the original CTM's "most certain" prediction might favor the baseline, relying solely on confidence can negatively impact calibration. The proposed method at the final tick achieves a better Expected Calibration Error (ECE) than the baseline at the most certain tick (0.10 vs 0.12), while maintaining competitive accuracy.
+- **Better Calibration**: While the original CTM's most certain prediction might favor the baseline, relying solely on confidence can negatively impact calibration. The proposed method at the final tick achieves a better ECE than the baseline at the most certain tick (0.10 vs 0.12), while maintaining competitive accuracy.
 
 - **Robustness**: The proposed method maintains high accuracy (84.3%) at the final tick with low variance (1.5), compared to the baseline's unstable performance (60.0% with high variance of 17.8). This demonstrates the robustness of dynamic weight adjustment for extended reasoning processes.
 
-- **Out-of-Distribution Generalization**: Confidence-based predictions can be hazardous for out-of-distribution (OOD) generalization. The proposed method's ability to maintain stable performance across all ticks makes it more reliable for real-world applications where the distribution of complexity may vary.
+- **Out-of-Distribution Generalization**: Confidence-based predictions can be hazardous for OOD generalization. The proposed method's ability to maintain stable performance across all ticks makes it more reliable for real-world applications where the distribution of complexity may vary.
