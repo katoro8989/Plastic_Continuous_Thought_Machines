@@ -236,16 +236,16 @@ We evaluate the proposed HyperCTM method on CIFAR-10 image classification and co
 
 The following figures compare learning trajectories for various accuracy metrics:
 
-![Most Certain Accuracy](img/accuracy_most_certain.png)
+![Most Certain Accuracy](./img/accuracy_most_certain.png)
 *Figure: Most Certain Accuracy comparison between baseline and proposed methods.*
 
-![Mean Accuracy](img/accuracy_mean.png)
+![Mean Accuracy](./img/accuracy_mean.png)
 *Figure: Average accuracy across all ticks comparison.*
 
-![Final Tick Accuracy](img/accuracy_final_tick.png)
+![Final Tick Accuracy](./img/accuracy_final_tick.png)
 *Figure: Accuracy at the final tick comparison.*
 
-![Final Iteration Ticks](img/final_iteration_ticks.png)
+![Final Iteration Ticks](./img/final_iteration_ticks.png)
 *Figure: Learning trajectories over training iterations.*
 
 ### Key Findings
