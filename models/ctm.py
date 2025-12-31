@@ -606,19 +606,20 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
     """
-    HyperNetwork版のContinuous Thought Machine
+    Continuous Thought Machine with HyperNetwork support.
     
-    通常のCTMに加えて、Synapseモジュールに動的な重み調整機能を追加します。
-    入力の状態に応じて重みをlow-rankで調整することで、より柔軟な思考処理を実現します。
+    In addition to the standard CTM, adds dynamic weight adjustment functionality
+    to the Synapse module. Enables more flexible thought processing by adjusting
+    weights in a low-rank manner based on input state.
     
-    追加引数:
-        hyper_layers (str): どの層をハイパー化するか
-            - 'none': ハイパーネットなし（通常のCTM）
-            - 'bottleneck': ボトルネック層のみ（推奨）
-            - 'down': Down projection層
-            - 'up': Up projection層
-            - 'all': すべての層
-        hyper_rank (int): LoRAのランク（デフォルト: 8）
+    Additional arguments:
+        hyper_layers (str): Which layers to hyperize
+            - 'none': No hypernetwork (standard CTM)
+            - 'bottleneck': Bottleneck layers only (recommended)
+            - 'down': Down projection layers
+            - 'up': Up projection layers
+            - 'all': All layers
+        hyper_rank (int): LoRA rank (default: 8)
     """
     
     def __init__(self,
@@ -641,22 +642,22 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',
                  n_random_pairing_self=0,
-                 # ハイパーネットワーク専用パラメータ（Synapse）
+                 # Hypernetwork-specific parameters (Synapse)
                  hyper_layers='bottleneck',
                  hyper_rank=8,
-                 # ハイパーネットワーク専用パラメータ（NLM）
+                 # Hypernetwork-specific parameters (NLM)
                  use_hyper_nlm=False,
                  hyper_nlm_rank=4,
                  ):
         
-        # ハイパーネットワーク関連のパラメータを保存
+        # Save hypernetwork-related parameters
         self.hyper_layers = hyper_layers
         self.hyper_rank = hyper_rank
         self.use_hyper_nlm = use_hyper_nlm
         self.hyper_nlm_rank = hyper_nlm_rank
         
-        # 親クラスの初期化
-        # これにより、get_synapsesがオーバーライドされた状態で呼ばれる
+        # Initialize parent class
+        # This ensures get_synapses is called in the overridden state
         super().__init__(
             iterations=iterations,
             d_model=d_model,
@@ -681,13 +682,12 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
     
     def get_synapses(self, synapse_depth, d_model, dropout):
         """
-        ハイパーネットワーク機能を持つシナプスモジュールを返す
+        Returns synapse module with hypernetwork functionality.
         
-        通常のCTMと異なり、HyperSynapseUNETを使用して動的な重み調整を実現します。
-        hyper_layers='none'の場合は、通常のSynapseUNETと同じ動作になります。
+        Unlike standard CTM, uses HyperSynapseUNET to enable dynamic weight adjustment.
+        When hyper_layers='none', behaves the same as standard SynapseUNET.
         """
         if synapse_depth == 1:
-            # depth=1の場合は通常の実装（ハイパーネット非対応）
             return nn.Sequential(
                 nn.Dropout(dropout),
                 nn.LazyLinear(d_model * 2),
@@ -695,7 +695,7 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
                 nn.LayerNorm(d_model)
             )
         else:
-            # HyperSynapseUNETを使用
+            # Use HyperSynapseUNET
             return HyperSynapseUNET(
                 out_dims=d_model,
                 depth=synapse_depth,
@@ -704,14 +704,6 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
                 minimum_width=16,
                 dropout=dropout
             )
-            # return HyperFastWeightSynapseUNET(
-            #     out_dims=d_model,
-            #     depth=synapse_depth,
-            #     hyper_layers=self.hyper_layers,
-            #     hyper_rank=self.hyper_rank,
-            #     minimum_width=16,
-            #     dropout=dropout
-            # )
 
 
     def get_neuron_level_models(self, deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout):
@@ -726,9 +718,9 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
         """
 
         if self.use_hyper_nlm:
-            # ハイパーネットワーク付きNLMを使用
+            # Use NLM with hypernetwork
             if deep_nlms:
-                # 後段のSuperLinearだけをHyperSuperLinearに置き換え
+                # Replace only the later SuperLinear with HyperSuperLinear
                 layers = [
                     SuperLinear(in_dims=memory_length, out_dims=2 * memory_hidden_dims, N=d_model,
                                 do_norm=do_layernorm_nlm, dropout=dropout),
@@ -741,7 +733,7 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
                 ]
                 return NLMBlock(layers)
             else:
-                # shallow NLMの場合もHyperSuperLinearを使用
+                # Use HyperSuperLinear for shallow NLM as well
                 layers = [
                     HyperSuperLinear(in_dims=memory_length, out_dims=2, N=d_model,
                                     rank=self.hyper_nlm_rank,
@@ -775,10 +767,9 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
     
     def forward(self, x, track=False):
         """
-        forward pass with hypernetwork support for NLM
+        Forward pass with hypernetwork support for NLM.
         
-        use_hyper_nlm=True の場合、NLMにcontextとして現在の
-        activated_stateを渡します。
+        When use_hyper_nlm=True, passes current activated_state as context to NLM.
         """
         B = x.size(0)
         device = x.device
@@ -831,7 +822,7 @@ class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
 
             # --- Apply Neuron-Level Models ---
             if self.use_hyper_nlm:
-                # contextとしてactivated_stateを渡す
+                # Pass activated_state as context
                 activated_state = self.trace_processor(state_trace, activated_state)
             else:
                 activated_state = self.trace_processor(state_trace)

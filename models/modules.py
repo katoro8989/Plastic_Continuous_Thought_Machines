@@ -149,11 +149,11 @@ class HyperLoRALinear(nn.Module):
         self.out_features = out_features
         self.rank = rank
 
-        # 1. Base Layer (Slow Weights) - 通常のLinear
+        # 1. Base Layer (Slow Weights) - Standard Linear layer
         self.base_layer = nn.Linear(in_features, out_features, bias=True)
 
         # 2. Hypernetwork Core (Controller)
-        # 制御信号zの次元は実行時に決まるため、LazyLinearを使用
+        # Use LazyLinear since the dimension of control signal z is determined at runtime
         self.context_net = nn.Sequential(
             nn.LazyLinear(hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -165,10 +165,10 @@ class HyperLoRALinear(nn.Module):
         self.head_u = nn.Linear(hidden_dim, out_features * rank)
         # V: [Batch, In, Rank]
         self.head_v = nn.Linear(hidden_dim, in_features * rank)
-        # Gate: [Batch, 1] - 変化の強さを動的に決める
+        # Gate: [Batch, 1] - Dynamically determines the strength of changes
         # self.head_gate = nn.Linear(hidden_dim, 1)
 
-        # 初期化 (重要): 学習初期は動的パスを無効化する
+        # Initialization (important): Disable dynamic path at the start of training
         self._reset_hyper_parameters()
 
     def _reset_hyper_parameters(self):
@@ -178,14 +178,14 @@ class HyperLoRALinear(nn.Module):
         nn.init.zeros_(self.head_u.bias)
         nn.init.zeros_(self.head_v.bias)
         
-        # # ✅ Gate: 負のバイアスで初期は抑制気味だが、学習可能
+        # # ✅ Gate: Initially suppressed with negative bias, but learnable
         # nn.init.kaiming_uniform_(self.head_gate.weight, a=math.sqrt(5))
         # nn.init.constant_(self.head_gate.bias, -1.0)  # tanh(-1) ≈ -0.76
 
     def forward(self, x, z=None):
         """
-        x: 入力信号 [Batch, In]
-        z: 制御信号 [Batch, In] (通常は x と同じだが、分離も可能)
+        x: Input signal [Batch, In]
+        z: Control signal [Batch, In] (usually same as x, but can be separated)
         """
         if z is None: z = x
 
@@ -193,19 +193,19 @@ class HyperLoRALinear(nn.Module):
         out_base = self.base_layer(x)
 
         # B. Hyper Path
-        # 1. コンテキスト生成
+        # 1. Generate context
         ctx = self.context_net(z) # [B, hidden]
 
-        # 2. パラメータ生成
+        # 2. Generate parameters
         # U: [B, Out, Rank]
         u = self.head_u(ctx).view(-1, self.out_features, self.rank)
         # V: [B, In, Rank]
         v = self.head_v(ctx).view(-1, self.in_features, self.rank)
-        # Gate: [B, 1] - tanh で -1~1 に制限すると安定しやすい
+        # Gate: [B, 1] - Limiting to -1~1 with tanh tends to be more stable
         # gate = torch.tanh(self.head_gate(ctx))
 
-        # 3. 動的重みの適用 (行列積の順序最適化)
-        # 通常の Wx = (U @ V.T) @ x だが、計算量削減のため U @ (V.T @ x) で計算
+        # 3. Apply dynamic weights (matrix multiplication order optimization)
+        # Normally Wx = (U @ V.T) @ x, but compute as U @ (V.T @ x) to reduce computation
         
         # term1 = V^T @ x -> [B, Rank]
         # x: [B, In] -> [B, In, 1]
@@ -214,102 +214,30 @@ class HyperLoRALinear(nn.Module):
         # term2 = U @ term1 -> [B, Out, 1]
         out_dynamic = torch.matmul(u, term1).squeeze(2)
 
-        # C. 統合
+        # C. Combine
         # return out_base + gate * out_dynamic
         return out_base + out_dynamic
 
-class FastWeightSynapse(nn.Module):
-    """
-    Hinton's Fast Weights (2016) / Linear Transformer variant.
-    
-    過去の思考ステップの情報を「重み行列」として蓄積・記憶します。
-    CTMの思考ループ内で、自身のシナプス結合強度を動的に書き換え続けます。
-    """
-    def __init__(self, in_features, out_features, rank=8, hidden_dim=64, 
-                 lambda_decay=0.9, eta_learning_rate=0.5, alpha_scale=0.1):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        
-        self.base_layer = nn.Linear(in_features, out_features)
-        
-        self.to_u = nn.Linear(in_features, out_features * rank) # Write Value
-        self.to_v = nn.Linear(in_features, in_features * rank)  # Write Key
-        
-        self.lambda_decay = lambda_decay
-        self.eta = eta_learning_rate
-        self.alpha = alpha_scale
-        
-        self.fast_weight_matrix = None 
-
-    def reset_memory(self, batch_size, device):
-        """思考開始時(t=0)にFast Weightsをゼロリセット"""
-        # A_0 = 0
-        self.fast_weight_matrix = torch.zeros(
-            batch_size, self.out_features, self.in_features, 
-            device=device
-        )
-
-    def forward(self, x, z=None):
-        """
-        x: [Batch, In]
-        """
-        batch_size = x.size(0)
-        
-        # 安全策: メモリが未初期化ならリセット
-        if self.fast_weight_matrix is None or self.fast_weight_matrix.size(0) != batch_size:
-            self.reset_memory(batch_size, x.device)
-            
-        # --- 1. Read (現在のFast Weightを使って計算) ---
-        # y = W_slow @ x + alpha * (A_{t-1} @ x)
-        
-        out_slow = self.base_layer(x)
-        
-        # A @ x: [B, Out, In] @ [B, In, 1] -> [B, Out, 1]
-        fast_contribution = torch.bmm(self.fast_weight_matrix, x.unsqueeze(2)).squeeze(2)
-        
-        out = out_slow + self.alpha * fast_contribution
-        
-        # --- 2. Write (ヘブ則的な更新) ---
-        # A_t = lambda * A_{t-1} + eta * (U @ V.T)
-        
-        # U, Vの生成 (Rankが1なら Hintonの h*h^T に近い外積更新になる)
-        # ここを U=x, V=x にすれば完全にHintonの元論文と同じになります
-        u = self.to_u(x).view(batch_size, self.out_features, self.rank)
-        v = self.to_v(x).view(batch_size, self.in_features, self.rank)
-        
-        # 外積の総和: Sum_r (u_r @ v_r.T)
-        delta_a = torch.bmm(u, v.transpose(1, 2))
-        
-        # 更新
-        self.fast_weight_matrix = (
-            self.lambda_decay * self.fast_weight_matrix + 
-            self.eta * delta_a
-        )
-        
-        return out
-
 class HyperSynapseUNET(nn.Module):
     """
-    ハイパーネットワークを持つSynapseUNET
+    SynapseUNET with hypernetwork support.
     
-    指定された層にHyperLoRALinearを適用し、入力xに応じて
-    動的に重みを調整できるようにします。
+    Applies HyperLoRALinear to specified layers, enabling dynamic weight adjustment
+    based on input x.
     
     Args:
-        out_dims: 出力次元
-        depth: UNET深さ
-        hyper_layers: どの層をハイパー化するか
-            - 'none': ハイパーネットなし（通常のSynapseUNET）
-            - 'bottleneck': ボトルネック層のみ
-            - 'up': Up projection層のみ
-            - 'down': Down projection層のみ
-            - 'all': すべての層
-            - list/set: 層インデックスのリスト（例: {0, 1, 6}）
-        hyper_rank: LoRAランク
-        minimum_width: ボトルネック幅
-        dropout: ドロップアウト率
+        out_dims: Output dimension
+        depth: UNET depth
+        hyper_layers: Which layers to hyperize
+            - 'none': No hypernetwork (standard SynapseUNET)
+            - 'bottleneck': Bottleneck layers only
+            - 'up': Up projection layers only
+            - 'down': Down projection layers only
+            - 'all': All layers
+            - list/set: List of layer indices (e.g., {0, 1, 6})
+        hyper_rank: LoRA rank
+        minimum_width: Bottleneck width
+        dropout: Dropout rate
     """
     def __init__(self,
                  out_dims,
@@ -383,11 +311,11 @@ class HyperSynapseUNET(nn.Module):
             self.skip_lns.append(nn.LayerNorm(int(widths[i])))
 
     def _determine_hyper_indices(self, num_blocks, hyper_layers):
-        """どの層インデックスをハイパー化するか決定"""
+        """Determine which layer indices to hyperize"""
         if hyper_layers == 'none':
             return set(), set()
         elif hyper_layers == 'bottleneck':
-            # ボトルネック = 最後のdown層と最初のup層
+            # Bottleneck = last down layer and first up layer
             return {num_blocks - 1}, {num_blocks - 1}
         elif hyper_layers == 'down':
             return set(range(num_blocks)), set()
@@ -396,7 +324,7 @@ class HyperSynapseUNET(nn.Module):
         elif hyper_layers == 'all':
             return set(range(num_blocks)), set(range(num_blocks))
         elif isinstance(hyper_layers, (list, set, tuple)):
-            # カスタムインデックス
+            # Custom indices
             indices = set(hyper_layers)
             return indices, indices
         else:
@@ -405,8 +333,8 @@ class HyperSynapseUNET(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: 入力テンソル (B, in_features)
-               ← これを条件ベクトルとしても使う
+            x: Input tensor (B, in_features)
+               ← Also used as condition vector
         """
         # Initial projection
         out_first = self.first_projection(x)
@@ -415,9 +343,9 @@ class HyperSynapseUNET(nn.Module):
         outs_down = [out_first]
         for i, layer_dict in enumerate(self.down_projections):
             out = layer_dict['dropout'](outs_down[-1])
-            # HyperLoRALinearか通常のLinearかで分岐
+            # Branch based on whether it's HyperLoRALinear or standard Linear
             if isinstance(layer_dict['linear'], HyperLoRALinear):
-                out = layer_dict['linear'](out, out)  # xを条件として渡す
+                out = layer_dict['linear'](out, out)  # Pass x as condition
             else:
                 out = layer_dict['linear'](out)
             out = layer_dict['norm'](out)
@@ -436,9 +364,9 @@ class HyperSynapseUNET(nn.Module):
             layer_dict = self.up_projections[up_layer_idx]
             
             out = layer_dict['dropout'](outs_up)
-            # HyperLoRALinearか通常のLinearかで分岐
+            # Branch based on whether it's HyperLoRALinear or standard Linear
             if isinstance(layer_dict['linear'], HyperLoRALinear):
-                out = layer_dict['linear'](out, out)  # xを条件として渡す
+                out = layer_dict['linear'](out, out)  # Pass x as condition
             else:
                 out = layer_dict['linear'](out)
             out = layer_dict['norm'](out)
@@ -456,165 +384,6 @@ class HyperSynapseUNET(nn.Module):
 
         # The final output after all up-projections
         return outs_up
-
-class HyperFastWeightSynapseUNET(nn.Module):
-    """
-    HyperFastWeightSynapse Layer: Implements Fast Weight Synapse (FWS) for the CTM.
-    """
-    def __init__(self,
-                 out_dims,
-                 depth,
-                 hyper_layers='bottleneck',
-                 hyper_rank=4,
-                 minimum_width=16,
-                 dropout=0.0):
-        super().__init__()
-        self.width_out = out_dims
-        self.n_deep = depth
-        self.hyper_layers = hyper_layers
-
-        # Define UNET structure based on depth
-        # Creates `depth` width values, leading to `depth-1` blocks
-        widths = np.linspace(out_dims, minimum_width, depth)
-        num_blocks = len(widths) - 1
-
-        hyper_down_indices, hyper_up_indices = self._determine_hyper_indices(
-            num_blocks, hyper_layers
-        )
-
-        self.hyper_down_indices = hyper_down_indices
-        self.hyper_up_indices = hyper_up_indices
-
-        # Initial projection layer
-        self.first_projection = nn.Sequential(
-            nn.LazyLinear(int(widths[0])), # Project to the first width
-            nn.LayerNorm(int(widths[0])),
-            nn.SiLU()
-        )
-
-        # Downward path (encoding layers)
-        self.down_projections = nn.ModuleList()
-        self.up_projections = nn.ModuleList()
-        self.skip_lns = nn.ModuleList()
-
-        for i in range(num_blocks):
-            if i in hyper_down_indices:
-                down_linear = FastWeightSynapse(
-                    int(widths[i]), int(widths[i+1]),
-                    rank=hyper_rank,
-                    hidden_dim=128, 
-                    lambda_decay=0.9, 
-                    eta_learning_rate=0.5, 
-                    alpha_scale=1,
-                )
-            else:
-                down_linear = nn.Linear(int(widths[i]), int(widths[i+1]))
-            # Down block: widths[i] -> widths[i+1]
-            self.down_projections.append(nn.ModuleDict({
-                'dropout': nn.Dropout(dropout),
-                'linear': down_linear,
-                'norm': nn.LayerNorm(int(widths[i+1])),
-                'act': nn.SiLU()
-            }))
-            # Up block: widths[i+1] -> widths[i]
-            # Note: Up blocks are added in order matching down blocks conceptually,
-            # but applied in reverse order in the forward pass.
-            if i in hyper_up_indices:
-                up_linear = FastWeightSynapse(
-                    int(widths[i+1]), int(widths[i]),
-                    rank=hyper_rank,
-                    hidden_dim=128, 
-                    lambda_decay=0.9, 
-                    eta_learning_rate=0.5, 
-                    alpha_scale=1,
-                )
-            else:
-                up_linear = nn.Linear(int(widths[i+1]), int(widths[i]))
-
-            self.up_projections.append(nn.ModuleDict({
-                'dropout': nn.Dropout(dropout),
-                'linear': up_linear,
-                'norm': nn.LayerNorm(int(widths[i])),
-                'act': nn.SiLU()
-            }))
-            # Skip connection LayerNorm operates on width[i]
-            self.skip_lns.append(nn.LayerNorm(int(widths[i])))
-
-    def _determine_hyper_indices(self, num_blocks, hyper_layers):
-        """どの層インデックスをハイパー化するか決定"""
-        if hyper_layers == 'none':
-            return set(), set()
-        elif hyper_layers == 'bottleneck':
-            # ボトルネック = 最後のdown層と最初のup層
-            return {num_blocks - 1}, {num_blocks - 1}
-        elif hyper_layers == 'down':
-            return set(range(num_blocks)), set()
-        elif hyper_layers == 'up':
-            return set(), set(range(num_blocks))
-        elif hyper_layers == 'all':
-            return set(range(num_blocks)), set(range(num_blocks))
-        elif isinstance(hyper_layers, (list, set, tuple)):
-            # カスタムインデックス
-            indices = set(hyper_layers)
-            return indices, indices
-        else:
-            raise ValueError(f"Invalid hyper_layers: {hyper_layers}")
-
-    def forward(self, x):
-        """
-        Args:
-            x: 入力テンソル (B, in_features)
-               ← これを条件ベクトルとしても使う
-        """
-        # Initial projection
-        out_first = self.first_projection(x)
-
-        # Downward path, storing outputs for skip connections
-        outs_down = [out_first]
-        for i, layer_dict in enumerate(self.down_projections):
-            out = layer_dict['dropout'](outs_down[-1])
-            # FastWeightSynapseか通常のLinearかで分岐
-            if isinstance(layer_dict['linear'], FastWeightSynapse):
-                out = layer_dict['linear'](out, out)  # xを条件として渡す
-            else:
-                out = layer_dict['linear'](out)
-            out = layer_dict['norm'](out)
-            out = layer_dict['act'](out)
-            outs_down.append(out)
-        # outs_down contains [level_0, level_1, ..., level_depth-1=bottleneck] outputs
-
-        # Upward path, starting from the bottleneck output
-        outs_up = outs_down[-1] # Bottleneck activation
-        num_blocks = len(self.up_projections) # Should be depth - 1
-
-        for i in range(num_blocks):
-            # Apply up projection in reverse order relative to down blocks
-            # up_projection[num_blocks - 1 - i] processes deeper features first
-            up_layer_idx = num_blocks - 1 - i
-            layer_dict = self.up_projections[up_layer_idx]
-            
-            out = layer_dict['dropout'](outs_up)
-            # FastWeightSynapseか通常のLinearかで分岐
-            if isinstance(layer_dict['linear'], FastWeightSynapse):
-                out = layer_dict['linear'](out, out)  # xを条件として渡す
-            else:
-                out = layer_dict['linear'](out)
-            out = layer_dict['norm'](out)
-            out = layer_dict['act'](out)
-
-            # Get corresponding skip connection from downward path
-            # skip_connection index = num_blocks - 1 - i (same as up_layer_idx)
-            # This matches the output width of the up_projection[up_layer_idx]
-            skip_idx = up_layer_idx
-            skip_connection = outs_down[skip_idx]
-
-            # Add skip connection and apply LayerNorm corresponding to this level
-            # skip_lns index also corresponds to the level = skip_idx
-            outs_up = self.skip_lns[skip_idx](out + skip_connection)
-
-        # The final output after all up-projections
-        return outs_up
-
 
 class SuperLinear(nn.Module):
     """
@@ -710,8 +479,8 @@ class SuperLinear(nn.Module):
 
 class NLMBlock(nn.Module):
     """
-    NLM（Neuron-Level Model）のブロック
-    contextを受け取れるようにnn.Sequentialの代わりに使用
+    NLM (Neuron-Level Model) block.
+    Used instead of nn.Sequential to allow receiving context.
     """
     def __init__(self, layers):
         super().__init__()
@@ -720,8 +489,8 @@ class NLMBlock(nn.Module):
     def forward(self, x, context=None):
         """
         Args:
-            x: 入力 (B, N, M)
-            context: 条件ベクトル (B, C) - HyperSuperLinearに渡される
+            x: Input (B, N, M)
+            context: Condition vector (B, C) - passed to HyperSuperLinear
         """
         out = x
         for layer in self.layers:
@@ -736,20 +505,20 @@ class NLMBlock(nn.Module):
 
 class HyperSuperLinear(nn.Module):
     """
-    ハイパーネットワークを持つSuperLinear層
+    SuperLinear layer with hypernetwork support.
     
-    各ニューロンは独立した重みを持ちながら、全ニューロンで共有された
-    ハイパーネットワークから生成される低ランク差分を追加で利用します。
+    Each neuron has independent weights while also utilizing low-rank differences
+    generated from a hypernetwork shared across all neurons.
     
     Args:
-        in_dims (int): 入力次元（memory_length）
-        out_dims (int): 出力次元
-        N (int): ニューロン数（d_model）
-        rank (int): LoRAのランク
-        hidden_dim (int): ハイパーネットワークの隠れ層次元
-        T (float): 温度パラメータ
-        do_norm (bool): LayerNormを適用するか
-        dropout (float): Dropout率
+        in_dims (int): Input dimension (memory_length)
+        out_dims (int): Output dimension
+        N (int): Number of neurons (d_model)
+        rank (int): LoRA rank
+        hidden_dim (int): Hidden layer dimension of hypernetwork
+        T (float): Temperature parameter
+        do_norm (bool): Whether to apply LayerNorm
+        dropout (float): Dropout rate
     """
     def __init__(self,
                  in_dims,
@@ -766,11 +535,11 @@ class HyperSuperLinear(nn.Module):
         self.N = N
         self.rank = rank
         
-        # 基本コンポーネント（通常のSuperLinear相当）
+        # Basic components (equivalent to standard SuperLinear)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else Identity()
         self.layernorm = nn.LayerNorm(in_dims, elementwise_affine=True) if do_norm else Identity()
         
-        # Base weights: 各ニューロンが独立した重みを持つ
+        # Base weights: Each neuron has independent weights
         self.register_parameter('w1_base', nn.Parameter(
             torch.empty((in_dims, out_dims, N)).uniform_(
                 -1/math.sqrt(in_dims + out_dims),
@@ -780,71 +549,71 @@ class HyperSuperLinear(nn.Module):
         self.register_parameter('b1', nn.Parameter(torch.zeros((1, N, out_dims)), requires_grad=True))
         self.register_parameter('T', nn.Parameter(torch.Tensor([T])))
         
-        # Hypernetwork (全ニューロンで共有)
-        # 条件ベクトルから低ランク差分を生成
+        # Hypernetwork (shared across all neurons)
+        # Generate low-rank differences from condition vector
         self.context_net = nn.Sequential(
             nn.LazyLinear(hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
         )
         
-        # U: (in_dims, rank), V: (out_dims, rank) を生成
+        # Generate U: (in_dims, rank), V: (out_dims, rank)
         self.head_u = nn.Linear(hidden_dim, in_dims * rank)
         self.head_v = nn.Linear(hidden_dim, out_dims * rank)
         
-        # # ニューロンごとのゲート（差分の強さを個別調整）
+        # # Per-neuron gate (individually adjusts strength of differences)
         # self.head_gate = nn.Linear(hidden_dim, N)
         
         self._reset_hyper_parameters()
     
     def _reset_hyper_parameters(self):
-        """ハイパーネットワークのパラメータを初期化"""
+        """Initialize hypernetwork parameters"""
         # nn.init.kaiming_uniform_(self.head_u.weight, a=math.sqrt(5))
         nn.init.zeros_(self.head_u.weight)
         nn.init.kaiming_uniform_(self.head_v.weight, a=math.sqrt(5))
         nn.init.zeros_(self.head_u.bias)
         nn.init.zeros_(self.head_v.bias)
         
-        # # ✅ Gate: 負のバイアスで初期は抑制気味だが、学習可能
+        # # ✅ Gate: Initially suppressed with negative bias, but learnable
         # nn.init.kaiming_uniform_(self.head_gate.weight, a=math.sqrt(5))
         # nn.init.constant_(self.head_gate.bias, -1.0)  # tanh(-1) ≈ -0.76
     
     def forward(self, x, context=None):
         """
         Args:
-            x: 入力 (B, N, in_dims) - 各ニューロンの履歴
-            context: 条件ベクトル (B, context_dim) - 例: activated_state
-                     Noneの場合はhypernetを使わない（base_weightのみ）
+            x: Input (B, N, in_dims) - history for each neuron
+            context: Condition vector (B, context_dim) - e.g., activated_state
+                     If None, hypernet is not used (base_weight only)
         Returns:
-            out: 出力 (B, N)
+            out: Output (B, N)
         """
         B = x.size(0)
         
-        # 前処理
+        # Preprocessing
         out = self.dropout(x)
         out = self.layernorm(out)  # (B, N, in_dims)
         
-        # A. Base Path: 各ニューロン独立の固定重み
+        # A. Base Path: Fixed weights independent for each neuron
         # einsum: (B,N,I) x (I,O,N) -> (B,N,O)
         out_base = torch.einsum('BNI,ION->BNO', out, self.w1_base) + self.b1
         
-        # contextがない場合はbase_weightのみ
+        # If context is None, use base_weight only
         if context is None:
             return out_base.squeeze(-1) / self.T
         
-        # B. Hyper Path: 条件から低ランク差分を生成
+        # B. Hyper Path: Generate low-rank differences from condition
         ctx = self.context_net(context)  # (B, hidden_dim)
         
-        # U, V生成（全ニューロンで共有される差分）
+        # Generate U, V (differences shared across all neurons)
         u = self.head_u(ctx).view(B, self.in_dims, self.rank)   # (B, in_dims, rank)
         v = self.head_v(ctx).view(B, self.out_dims, self.rank)  # (B, out_dims, rank)
         
-        # # ニューロンごとのゲート
+        # # Per-neuron gate
         # gate = torch.tanh(self.head_gate(ctx))  # (B, N)
         
-        # C. 低ランク差分の適用
-        # ΔW = U @ V^T を各ニューロンに適用
-        # 計算順序の最適化: (out @ U) @ V^T
+        # C. Apply low-rank differences
+        # Apply ΔW = U @ V^T to each neuron
+        # Computation order optimization: (out @ U) @ V^T
         
         # Step 1: out @ U
         # out: (B, N, in_dims), u: (B, in_dims, rank) -> term1: (B, N, rank)
@@ -854,8 +623,8 @@ class HyperSuperLinear(nn.Module):
         # term1: (B, N, rank), v: (B, out_dims, rank) -> out_dynamic: (B, N, out_dims)
         out_dynamic = torch.einsum('BNR,BOR->BNO', term1, v)
         
-        # D. ゲートを適用して統合
-        # gate: (B, N) -> (B, N, 1)に拡張して掛け算
+        # D. Apply gate and combine
+        # Expand gate: (B, N) -> (B, N, 1) and multiply
         # out_dynamic = gate.unsqueeze(-1) * out_dynamic
         
         # E. Base + Dynamic
