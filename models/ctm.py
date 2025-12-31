@@ -4,7 +4,7 @@ import numpy as np
 import math
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
-from models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
+from models.modules import ParityBackbone, SynapseUNET, HyperSynapseUNET, HyperFastWeightSynapseUNET, Squeeze, SuperLinear, HyperSuperLinear, NLMBlock, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from models.resnet import prepare_resnet_backbone
 from models.utils import compute_normalized_entropy
 
@@ -602,3 +602,259 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
 
+
+
+class HyperContinuousThoughtMachine(ContinuousThoughtMachine):
+    """
+    HyperNetwork版のContinuous Thought Machine
+    
+    通常のCTMに加えて、Synapseモジュールに動的な重み調整機能を追加します。
+    入力の状態に応じて重みをlow-rankで調整することで、より柔軟な思考処理を実現します。
+    
+    追加引数:
+        hyper_layers (str): どの層をハイパー化するか
+            - 'none': ハイパーネットなし（通常のCTM）
+            - 'bottleneck': ボトルネック層のみ（推奨）
+            - 'down': Down projection層
+            - 'up': Up projection層
+            - 'all': すべての層
+        hyper_rank (int): LoRAのランク（デフォルト: 8）
+    """
+    
+    def __init__(self,
+                 iterations,
+                 d_model,
+                 d_input,
+                 heads,
+                 n_synch_out,
+                 n_synch_action,
+                 synapse_depth,
+                 memory_length,
+                 deep_nlms,
+                 memory_hidden_dims,
+                 do_layernorm_nlm,
+                 backbone_type,
+                 positional_embedding_type,
+                 out_dims,
+                 prediction_reshaper=[-1],
+                 dropout=0,
+                 dropout_nlm=None,
+                 neuron_select_type='random-pairing',
+                 n_random_pairing_self=0,
+                 # ハイパーネットワーク専用パラメータ（Synapse）
+                 hyper_layers='bottleneck',
+                 hyper_rank=8,
+                 # ハイパーネットワーク専用パラメータ（NLM）
+                 use_hyper_nlm=False,
+                 hyper_nlm_rank=4,
+                 ):
+        
+        # ハイパーネットワーク関連のパラメータを保存
+        self.hyper_layers = hyper_layers
+        self.hyper_rank = hyper_rank
+        self.use_hyper_nlm = use_hyper_nlm
+        self.hyper_nlm_rank = hyper_nlm_rank
+        
+        # 親クラスの初期化
+        # これにより、get_synapsesがオーバーライドされた状態で呼ばれる
+        super().__init__(
+            iterations=iterations,
+            d_model=d_model,
+            d_input=d_input,
+            heads=heads,
+            n_synch_out=n_synch_out,
+            n_synch_action=n_synch_action,
+            synapse_depth=synapse_depth,
+            memory_length=memory_length,
+            deep_nlms=deep_nlms,
+            memory_hidden_dims=memory_hidden_dims,
+            do_layernorm_nlm=do_layernorm_nlm,
+            backbone_type=backbone_type,
+            positional_embedding_type=positional_embedding_type,
+            out_dims=out_dims,
+            prediction_reshaper=prediction_reshaper,
+            dropout=dropout,
+            dropout_nlm=dropout_nlm,
+            neuron_select_type=neuron_select_type,
+            n_random_pairing_self=n_random_pairing_self,
+        )
+    
+    def get_synapses(self, synapse_depth, d_model, dropout):
+        """
+        ハイパーネットワーク機能を持つシナプスモジュールを返す
+        
+        通常のCTMと異なり、HyperSynapseUNETを使用して動的な重み調整を実現します。
+        hyper_layers='none'の場合は、通常のSynapseUNETと同じ動作になります。
+        """
+        if synapse_depth == 1:
+            # depth=1の場合は通常の実装（ハイパーネット非対応）
+            return nn.Sequential(
+                nn.Dropout(dropout),
+                nn.LazyLinear(d_model * 2),
+                nn.GLU(),
+                nn.LayerNorm(d_model)
+            )
+        else:
+            # HyperSynapseUNETを使用
+            return HyperSynapseUNET(
+                out_dims=d_model,
+                depth=synapse_depth,
+                hyper_layers=self.hyper_layers,
+                hyper_rank=self.hyper_rank,
+                minimum_width=16,
+                dropout=dropout
+            )
+            # return HyperFastWeightSynapseUNET(
+            #     out_dims=d_model,
+            #     depth=synapse_depth,
+            #     hyper_layers=self.hyper_layers,
+            #     hyper_rank=self.hyper_rank,
+            #     minimum_width=16,
+            #     dropout=dropout
+            # )
+
+
+    def get_neuron_level_models(self, deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout):
+        """
+        Neuron level models are one of the core innovations of the CTM. They apply separate MLPs/linears to 
+        each neuron.
+        NOTE: the name 'SuperLinear' is largely legacy, but its purpose is to apply separate linear layers
+            per neuron. It is sort of a 'grouped linear' function, where the group size is equal to 1. 
+            One could make the group size bigger and use fewer parameters, but that is future work.
+
+        NOTE: We used GLU() nonlinearities because they worked well in practice. 
+        """
+
+        if self.use_hyper_nlm:
+            # ハイパーネットワーク付きNLMを使用
+            if deep_nlms:
+                # 後段のSuperLinearだけをHyperSuperLinearに置き換え
+                layers = [
+                    SuperLinear(in_dims=memory_length, out_dims=2 * memory_hidden_dims, N=d_model,
+                                do_norm=do_layernorm_nlm, dropout=dropout),
+                    nn.GLU(),
+                    HyperSuperLinear(in_dims=memory_hidden_dims, out_dims=2, N=d_model,
+                                    rank=self.hyper_nlm_rank,
+                                    do_norm=do_layernorm_nlm, dropout=dropout),
+                    nn.GLU(),
+                    Squeeze(-1)
+                ]
+                return NLMBlock(layers)
+            else:
+                # shallow NLMの場合もHyperSuperLinearを使用
+                layers = [
+                    HyperSuperLinear(in_dims=memory_length, out_dims=2, N=d_model,
+                                    rank=self.hyper_nlm_rank,
+                                    do_norm=do_layernorm_nlm, dropout=dropout),
+                    nn.GLU(),
+                    Squeeze(-1)
+                ]
+                return NLMBlock(layers)
+        else:
+            if deep_nlms:
+                return nn.Sequential(
+                    nn.Sequential(
+                        SuperLinear(in_dims=memory_length, out_dims=2 * memory_hidden_dims, N=d_model,
+                                    do_norm=do_layernorm_nlm, dropout=dropout),
+                        nn.GLU(),
+                        SuperLinear(in_dims=memory_hidden_dims, out_dims=2, N=d_model,
+                                    do_norm=do_layernorm_nlm, dropout=dropout),
+                        nn.GLU(),
+                        Squeeze(-1)
+                    )
+                )
+            else:
+                return nn.Sequential(
+                    nn.Sequential(
+                        SuperLinear(in_dims=memory_length, out_dims=2, N=d_model,
+                                    do_norm=do_layernorm_nlm, dropout=dropout),
+                        nn.GLU(),
+                        Squeeze(-1)
+                    )
+                )
+    
+    def forward(self, x, track=False):
+        """
+        forward pass with hypernetwork support for NLM
+        
+        use_hyper_nlm=True の場合、NLMにcontextとして現在の
+        activated_stateを渡します。
+        """
+        B = x.size(0)
+        device = x.device
+
+        # --- Tracking Initialization ---
+        pre_activations_tracking = []
+        post_activations_tracking = []
+        synch_out_tracking = []
+        synch_action_tracking = []
+        attention_tracking = []
+
+        # --- Featurise Input Data ---
+        kv = self.compute_features(x)
+
+        # --- Initialise Recurrent State ---
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
+
+        # --- Prepare Storage for Outputs per Iteration ---
+        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+
+        # --- Initialise Recurrent Synch Values  ---
+        decay_alpha_action, decay_beta_action = None, None
+        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
+        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
+        r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+
+        _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
+
+        for module in self.modules():
+            if hasattr(module, 'reset_memory'):
+                module.reset_memory(B, device)
+
+        # --- Recurrent Loop  ---
+        for stepi in range(self.iterations):
+
+            # --- Calculate Synchronisation for Input Data Interaction ---
+            synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+
+            # --- Interact with Data via Attention ---
+            q = self.q_proj(synchronisation_action).unsqueeze(1)
+            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+            attn_out = attn_out.squeeze(1)
+            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+
+            # --- Apply Synapses ---
+            state = self.synapses(pre_synapse_input)
+            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+
+            # --- Apply Neuron-Level Models ---
+            if self.use_hyper_nlm:
+                # contextとしてactivated_stateを渡す
+                activated_state = self.trace_processor(state_trace, activated_state)
+            else:
+                activated_state = self.trace_processor(state_trace)
+
+            # --- Calculate Synchronisation for Output Predictions ---
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+
+            # --- Get Predictions and Certainties ---
+            current_prediction = self.output_projector(synchronisation_out)
+            current_certainty = self.compute_certainty(current_prediction)
+
+            predictions[..., stepi] = current_prediction
+            certainties[..., stepi] = current_certainty
+
+            # --- Tracking ---
+            if track:
+                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                attention_tracking.append(attn_weights.detach().cpu().numpy())
+                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
+                synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+
+        # --- Return Values ---
+        if track:
+            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+        return predictions, certainties, synchronisation_out

@@ -17,7 +17,7 @@ from data.custom_datasets import ImageNet
 from torchvision import datasets
 from torchvision import transforms
 from tasks.image_classification.imagenet_classes import IMAGENET2012_CLASSES
-from models.ctm import ContinuousThoughtMachine
+from models.ctm import ContinuousThoughtMachine, HyperContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.image_classification.plotting import plot_neural_dynamics, make_classification_gif
@@ -86,6 +86,21 @@ def parse_args():
     parser.add_argument('--memory_hidden_dims', type=int, default=4, help='Hidden dimensions of the memory if using deep memory (CTM only).')
     parser.add_argument('--dropout_nlm', type=float, default=None, help='Dropout rate for NLMs specifically. Unset to match dropout on the rest of the model (CTM only).')
     parser.add_argument('--do_normalisation', action=argparse.BooleanOptionalAction, default=False, help='Apply normalization in NLMs (CTM only).')
+    
+    # HyperCTM specific (Synapse)
+    parser.add_argument('--use_hyper', action='store_true', help='Use HyperContinuousThoughtMachine instead of standard CTM.')
+    parser.add_argument('--hyper_layers', type=str, default='bottleneck', 
+                        choices=['none', 'bottleneck', 'down', 'up', 'all'],
+                        help='Which layers to apply hypernetwork to in Synapse (HyperCTM only).')
+    parser.add_argument('--hyper_rank', type=int, default=8, 
+                        help='Rank for LoRA decomposition in Synapse hypernetwork (HyperCTM only).')
+    
+    # HyperCTM specific (NLM)
+    parser.add_argument('--use_hyper_nlm', action='store_true', 
+                        help='Use HyperSuperLinear for NLMs (HyperCTM only).')
+    parser.add_argument('--hyper_nlm_rank', type=int, default=4,
+                        help='Rank for LoRA decomposition in NLM hypernetwork (HyperCTM only).')
+    
     # LSTM specific
     parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM stacked layers (LSTM only).')
 
@@ -224,27 +239,39 @@ if __name__=='__main__':
     # Build model conditionally
     model = None
     if args.model == 'ctm':
-        model = ContinuousThoughtMachine(
-            iterations=args.iterations,
-            d_model=args.d_model,
-            d_input=args.d_input,
-            heads=args.heads,
-            n_synch_out=args.n_synch_out,
-            n_synch_action=args.n_synch_action,
-            synapse_depth=args.synapse_depth,
-            memory_length=args.memory_length,
-            deep_nlms=args.deep_memory,
-            memory_hidden_dims=args.memory_hidden_dims,
-            do_layernorm_nlm=args.do_normalisation,
-            backbone_type=args.backbone_type,
-            positional_embedding_type=args.positional_embedding_type,
-            out_dims=args.out_dims,
-            prediction_reshaper=prediction_reshaper,
-            dropout=args.dropout,
-            dropout_nlm=args.dropout_nlm,
-            neuron_select_type=args.neuron_select_type,
-            n_random_pairing_self=args.n_random_pairing_self,
-        ).to(device)
+        ctm_kwargs = {
+            'iterations': args.iterations,
+            'd_model': args.d_model,
+            'd_input': args.d_input,
+            'heads': args.heads,
+            'n_synch_out': args.n_synch_out,
+            'n_synch_action': args.n_synch_action,
+            'synapse_depth': args.synapse_depth,
+            'memory_length': args.memory_length,
+            'deep_nlms': args.deep_memory,
+            'memory_hidden_dims': args.memory_hidden_dims,
+            'do_layernorm_nlm': args.do_normalisation,
+            'backbone_type': args.backbone_type,
+            'positional_embedding_type': args.positional_embedding_type,
+            'out_dims': args.out_dims,
+            'prediction_reshaper': prediction_reshaper,
+            'dropout': args.dropout,
+            'dropout_nlm': args.dropout_nlm,
+            'neuron_select_type': args.neuron_select_type,
+            'n_random_pairing_self': args.n_random_pairing_self,
+        }
+        
+        # HyperCTMを使用するかどうかで分岐
+        if args.use_hyper:
+            print(f"Using HyperContinuousThoughtMachine with hyper_layers={args.hyper_layers}, hyper_rank={args.hyper_rank}, use_hyper_nlm={args.use_hyper_nlm}, hyper_nlm_rank={args.hyper_nlm_rank}")
+            ctm_kwargs['hyper_layers'] = args.hyper_layers
+            ctm_kwargs['hyper_rank'] = args.hyper_rank
+            ctm_kwargs['use_hyper_nlm'] = args.use_hyper_nlm
+            ctm_kwargs['hyper_nlm_rank'] = args.hyper_nlm_rank
+            model = HyperContinuousThoughtMachine(**ctm_kwargs).to(device)
+        else:
+            print("Using standard ContinuousThoughtMachine")
+            model = ContinuousThoughtMachine(**ctm_kwargs).to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
             num_layers=args.num_layers,

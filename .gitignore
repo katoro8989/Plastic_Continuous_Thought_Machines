@@ -5,6 +5,7 @@ logs
 *.pdf
 *.gif
 *.out
+*.log
 *.pyc
 *.env
 *.pt
