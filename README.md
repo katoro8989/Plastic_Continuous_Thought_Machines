@@ -227,3 +227,50 @@ python -m tasks.image_classification.train \
 - `--hyper_nlm_rank`: LoRA rank for NLM hypernetworks (typically 4-8)
 
 For a fair comparison with the baseline, you may want to increase `--d_model` to match the additional parameters introduced by the hypernetwork.
+
+## Results
+
+We evaluate the proposed HyperCTM method on CIFAR-10 image classification and compare it with the baseline CTM. The results demonstrate the advantages of dynamic weight adjustment for maintaining stable performance over extended thought processes.
+
+### Learning Trajectories
+
+The following figures compare learning trajectories for various accuracy metrics:
+
+![Most Certain Accuracy](img/accuracy_most_certain.png)
+*Figure: Most Certain Accuracy comparison between baseline and proposed methods.*
+
+![Mean Accuracy](img/accuracy_mean.png)
+*Figure: Average accuracy across all ticks comparison.*
+
+![Final Tick Accuracy](img/accuracy_final_tick.png)
+*Figure: Accuracy at the final tick comparison.*
+
+![Final Iteration Ticks](img/final_iteration_ticks.png)
+*Figure: Learning trajectories over training iterations.*
+
+### Key Findings
+
+1. **Most Certain Accuracy**: The baseline and proposed methods show almost no difference, with the baseline slightly outperforming (86.5% vs 85.6%). This indicates that both methods can achieve similar peak performance when selecting predictions based on confidence.
+
+2. **Average and Final Tick Accuracy**: The proposed method demonstrates superior test performance for both average accuracy across all ticks and accuracy at the final tick. This improvement is particularly significant at the final tick, where the baseline method shows unstable and declining performance.
+
+3. **Stability**: The baseline method is vulnerable to performance degradation with prolonged "thought" processes due to fixed weights. In contrast, the proposed method remains stable and even improves performance over time by using dynamic weight adjustments to handle increasing complexity.
+
+### Quantitative Results
+
+**Table 1: Comparison of test accuracy and ECE at the most certain tick and the final tick.**
+
+| Method    | At most certain             | At final tick               |
+| :-------- | :-------------------------- | :-------------------------- |
+| **Baseline**  | ACC: 86.5±0.1 ECE: 0.12±0.00 | ACC: 60.0±17.8 ECE: 0.26±0.15 |
+| **Proposed**  | ACC: 85.6±0.1 ECE: 0.13±0.00 | ACC: 84.3±1.5 ECE: 0.10±0.01  |
+
+### Discussion
+
+The results highlight several important advantages of the proposed approach:
+
+- **Better Calibration**: While the original CTM's "most certain" prediction might favor the baseline, relying solely on confidence can negatively impact calibration. The proposed method at the final tick achieves a better Expected Calibration Error (ECE) than the baseline at the most certain tick (0.10 vs 0.12), while maintaining competitive accuracy.
+
+- **Robustness**: The proposed method maintains high accuracy (84.3%) at the final tick with low variance (1.5), compared to the baseline's unstable performance (60.0% with high variance of 17.8). This demonstrates the robustness of dynamic weight adjustment for extended reasoning processes.
+
+- **Out-of-Distribution Generalization**: Confidence-based predictions can be hazardous for out-of-distribution (OOD) generalization. The proposed method's ability to maintain stable performance across all ticks makes it more reliable for real-world applications where the distribution of complexity may vary.
